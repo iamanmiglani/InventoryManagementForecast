@@ -28,13 +28,11 @@ def split_data(data):
 # Forecasting Functions
 # -----------------------------------
 def forecast_prophet_univariate(train, forecast_days):
-    # Prophet expects columns 'ds' and 'y'
     df_train = train[['Date', 'Units_sold']].rename(columns={'Date': 'ds', 'Units_sold': 'y'})
     model = Prophet()
     model.fit(df_train)
     future = model.make_future_dataframe(periods=forecast_days)
     forecast = model.predict(future)
-    # Only get the last forecast_days rows (forecast for the test period)
     forecast_test = forecast[['ds', 'yhat']].tail(forecast_days)
     return forecast_test
 
@@ -45,7 +43,6 @@ def forecast_prophet_multivariate(train, forecast_days, regressors):
         model.add_regressor(reg)
     model.fit(df_train)
     future = model.make_future_dataframe(periods=forecast_days)
-    # For each regressor, use the last observed value
     for reg in regressors:
         future[reg] = df_train[reg].iloc[-1]
     forecast = model.predict(future)
@@ -53,7 +50,6 @@ def forecast_prophet_multivariate(train, forecast_days, regressors):
     return forecast_test
 
 def alternative_forecast_model(train, test_subset):
-    # Alternative model: use the last observed training value as a constant forecast.
     last_value = train['Units_sold'].iloc[-1]
     forecast_values = [last_value] * len(test_subset)
     forecast_test = pd.DataFrame({"yhat": forecast_values}, index=test_subset['Date'])
@@ -100,7 +96,6 @@ if mape_uni <= 15:
     final_forecast = forecast_uni
     decision_note = "Univariate forecast accepted (MAPE ≤ 15%). No further models computed."
 else:
-    # Univariate is above threshold; check for multivariate if extra regressors exist.
     if all(col in train.columns for col in ['Promotion', 'Price']):
         forecast_multi = forecast_prophet_multivariate(train, forecast_days, ['Promotion', 'Price'])
         mape_multi = calculate_mape(test_subset['Units_sold'].values, forecast_multi['yhat'].values)
@@ -109,30 +104,19 @@ else:
             final_forecast = forecast_multi
             decision_note = "Multivariate forecast accepted (MAPE ≤ 15%). Alternative model not computed."
         else:
-            # Neither univariate nor multivariate are acceptable; compute alternative.
             forecast_alt = alternative_forecast_model(train, test_subset)
             mape_alt = calculate_mape(test_subset['Units_sold'].values, forecast_alt['yhat'].values)
-            # Choose the method with the lowest error among the ones computed.
             error_dict = {"univariate": mape_uni, "multivariate": mape_multi, "alternative": mape_alt}
             final_method = min(error_dict, key=error_dict.get)
-            if final_method == "univariate":
-                final_forecast = forecast_uni
-            elif final_method == "multivariate":
-                final_forecast = forecast_multi
-            else:
-                final_forecast = forecast_alt
+            final_forecast = forecast_uni if final_method == "univariate" else (forecast_multi if final_method == "multivariate" else forecast_alt)
             decision_note = ("None of the forecasts met the acceptable threshold. " +
                              f"Method with the lowest MAPE selected: {final_method}.")
     else:
-        # Multivariate is not available; compute alternative forecast.
         forecast_alt = alternative_forecast_model(train, test_subset)
         mape_alt = calculate_mape(test_subset['Units_sold'].values, forecast_alt['yhat'].values)
         error_dict = {"univariate": mape_uni, "alternative": mape_alt}
         final_method = min(error_dict, key=error_dict.get)
-        if final_method == "univariate":
-            final_forecast = forecast_uni
-        else:
-            final_forecast = forecast_alt
+        final_forecast = forecast_uni if final_method == "univariate" else forecast_alt
         decision_note = ("Multivariate forecast not available. " +
                          f"Final forecast selected: {final_method}.")
 
@@ -140,7 +124,6 @@ else:
 # Display Forecast Metrics
 # -----------------------------------
 st.write("### Forecast Comparison Metrics")
-# Prepare a DataFrame only for the forecasts that were computed.
 metrics = {"Forecast Method": [], "MAPE (%)": []}
 metrics["Forecast Method"].append("Univariate")
 metrics["MAPE (%)"].append(f"{mape_uni:.2f}")
@@ -150,8 +133,8 @@ if forecast_multi is not None:
 if forecast_alt is not None:
     metrics["Forecast Method"].append("Alternative")
     metrics["MAPE (%)"].append(f"{mape_alt:.2f}")
-metrics["Forecast Method"].append("Final Decision")
 final_mape = calculate_mape(test_subset['Units_sold'].values, final_forecast['yhat'].values)
+metrics["Forecast Method"].append("Final Decision")
 metrics["MAPE (%)"].append(f"{final_method} ({final_mape:.2f})")
 metrics_df = pd.DataFrame(metrics)
 st.table(metrics_df)
@@ -159,38 +142,39 @@ st.table(metrics_df)
 st.write("**Decision Note:**", decision_note)
 
 # -----------------------------------
-# Visualization: Historical Data and Final Forecast
+# Visualization: Historical Data (last 60 days) and Final Forecast
 # -----------------------------------
 st.write("### Historical Data and Final Forecast")
 
-# Historical data (all training data) in blue
-historical_data = train[['Date', 'Units_sold']].copy()
+# Select the last 60 days of historical data (if available)
+historical_data = train[['Date', 'Units_sold']].copy().sort_values("Date").tail(60)
 historical_data["Type"] = "Historical"
 
-# Final forecast in green; adjust column names for consistency
+# Prepare final forecast data and rename columns for consistency
 forecast_vis = final_forecast.copy().rename(columns={'ds': 'Date', 'yhat': 'Units_sold'})
 forecast_vis["Type"] = "Forecast"
 
-# Combine historical data and forecast
+# Combine historical data and forecast so that the time axis is continuous.
 plot_df = pd.concat([
     historical_data[['Date', 'Units_sold', 'Type']],
     forecast_vis[['Date', 'Units_sold', 'Type']]
 ]).sort_values("Date")
 
-# Create an interactive Altair chart so that users can zoom/pan.
+# Create an interactive Altair chart (users can zoom/pan)
 chart = alt.Chart(plot_df).mark_line().encode(
     x=alt.X('Date:T', axis=alt.Axis(title="Date")),
     y=alt.Y('Units_sold:Q', axis=alt.Axis(title="Units Sold")),
-    color=alt.Color('Type:N', scale=alt.Scale(domain=['Historical', 'Forecast'], range=['blue', 'green']))
+    color=alt.Color('Type:N', scale=alt.Scale(domain=['Historical', 'Forecast'],
+                                                range=['blue', 'green']))
 ).interactive().properties(
     width=700,
     height=400,
-    title="Historical Data (Blue) and Final Forecast (Green)"
+    title="Last 60 Days of Historical Data (Blue) and Final Forecast (Green)"
 )
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------------
-# Detailed Forecast Output: Only show the final forecast details
+# Final Forecast Output (Detailed)
 # -----------------------------------
 st.write("## Final Forecast Output")
 st.dataframe(final_forecast)
