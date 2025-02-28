@@ -12,14 +12,14 @@ import altair as alt
 @st.cache_data
 def load_data():
     data = pd.read_csv("units_sold_data.csv", parse_dates=['Date'])
-    # Remove any leading/trailing spaces from column names
+    # Clean column names: remove extra spaces
     data.columns = data.columns.str.strip()
     return data
 
 def split_data(data):
-    # Training data: all dates up to November 30, 2023
+    # Training: all dates up to November 30, 2023
     train = data[data['Date'] <= pd.to_datetime("2023-11-30")].copy()
-    # Test data: December 1 to December 10, 2023
+    # Test: December 1 - December 10, 2023 (all available; we’ll use a subset per slider)
     test = data[(data['Date'] >= pd.to_datetime("2023-12-01")) &
                 (data['Date'] <= pd.to_datetime("2023-12-10"))].copy()
     return train, test
@@ -28,12 +28,13 @@ def split_data(data):
 # Forecasting Functions
 # -----------------------------------
 def forecast_prophet_univariate(train, forecast_days):
+    # Prophet expects columns 'ds' and 'y'
     df_train = train[['Date', 'Units_sold']].rename(columns={'Date': 'ds', 'Units_sold': 'y'})
     model = Prophet()
     model.fit(df_train)
     future = model.make_future_dataframe(periods=forecast_days)
     forecast = model.predict(future)
-    # Return only the forecast for the last forecast_days
+    # Only get the last forecast_days rows (forecast for the test period)
     forecast_test = forecast[['ds', 'yhat']].tail(forecast_days)
     return forecast_test
 
@@ -44,7 +45,7 @@ def forecast_prophet_multivariate(train, forecast_days, regressors):
         model.add_regressor(reg)
     model.fit(df_train)
     future = model.make_future_dataframe(periods=forecast_days)
-    # For future dates, use the last observed value for each regressor.
+    # For each regressor, use the last observed value
     for reg in regressors:
         future[reg] = df_train[reg].iloc[-1]
     forecast = model.predict(future)
@@ -52,29 +53,15 @@ def forecast_prophet_multivariate(train, forecast_days, regressors):
     return forecast_test
 
 def alternative_forecast_model(train, test_subset):
-    # A simple alternative: use the last observed value from training data.
+    # Alternative model: use the last observed training value as a constant forecast.
     last_value = train['Units_sold'].iloc[-1]
     forecast_values = [last_value] * len(test_subset)
-    # Create a DataFrame with dates from test_subset
     forecast_test = pd.DataFrame({"yhat": forecast_values}, index=test_subset['Date'])
     forecast_test = forecast_test.reset_index().rename(columns={'index': 'ds'})
     return forecast_test
 
 def calculate_mape(y_true, y_pred):
     return mean_absolute_percentage_error(y_true, y_pred) * 100
-
-# -----------------------------------
-# RL Q-Table Helper (for display only)
-# -----------------------------------
-def choose_forecast_method(q_table, state="high"):
-    """
-    Given a Q-table and a state, return the forecast method with the highest Q-value.
-    (This function is now only used to display Q-values.)
-    """
-    actions = ["univariate", "multivariate", "alternative"]
-    q_values = {action: q_table.get((state, action), 0) for action in actions}
-    best_action = max(q_values, key=q_values.get)
-    return best_action, q_values
 
 # -----------------------------------
 # Sidebar: Forecast Horizon Selection
@@ -94,89 +81,82 @@ train, test = split_data(data)
 test_subset = test.head(forecast_days)
 
 # -----------------------------------
-# Compute All Forecasts and their MAPE
+# Forecast Computation and Stopping Logic
 # -----------------------------------
-st.write("## Forecast Results")
+st.write("## Forecast Computation and Decision")
 
-# Univariate Forecast
+# Always compute the univariate forecast first
 forecast_uni = forecast_prophet_univariate(train, forecast_days)
 mape_uni = calculate_mape(test_subset['Units_sold'].values, forecast_uni['yhat'].values)
 
-# Multivariate Forecast (if additional regressors exist)
-if all(col in train.columns for col in ['Promotion', 'Price']):
-    forecast_multi = forecast_prophet_multivariate(train, forecast_days, ['Promotion', 'Price'])
-    mape_multi = calculate_mape(test_subset['Units_sold'].values, forecast_multi['yhat'].values)
-else:
-    forecast_multi = None
-    mape_multi = None
+# Initialize variables for multivariate and alternative forecasts
+forecast_multi = None
+mape_multi = None
+forecast_alt = None
+mape_alt = None
 
-# Alternative Forecast
-forecast_alt = alternative_forecast_model(train, test_subset)
-mape_alt = calculate_mape(test_subset['Units_sold'].values, forecast_alt['yhat'].values)
-
-# -----------------------------------
-# Final Forecast Decision with Stopping Rule
-# -----------------------------------
-# If univariate forecast error is acceptable (MAPE <= 15%), choose it immediately.
 if mape_uni <= 15:
     final_method = "univariate"
     final_forecast = forecast_uni
-    decision_note = "Univariate forecast accepted (MAPE ≤ 15%). RL layer stops here."
+    decision_note = "Univariate forecast accepted (MAPE ≤ 15%). No further models computed."
 else:
-    # Otherwise, if multivariate is available and acceptable, choose it.
-    if forecast_multi is not None and mape_multi <= 15:
-        final_method = "multivariate"
-        final_forecast = forecast_multi
-        decision_note = "Multivariate forecast accepted (MAPE ≤ 15%)."
-    # Else if alternative forecast is acceptable, choose it.
-    elif mape_alt <= 15:
-        final_method = "alternative"
-        final_forecast = forecast_alt
-        decision_note = "Alternative forecast accepted (MAPE ≤ 15%)."
+    # Univariate is above threshold; check for multivariate if extra regressors exist.
+    if all(col in train.columns for col in ['Promotion', 'Price']):
+        forecast_multi = forecast_prophet_multivariate(train, forecast_days, ['Promotion', 'Price'])
+        mape_multi = calculate_mape(test_subset['Units_sold'].values, forecast_multi['yhat'].values)
+        if mape_multi <= 15:
+            final_method = "multivariate"
+            final_forecast = forecast_multi
+            decision_note = "Multivariate forecast accepted (MAPE ≤ 15%). Alternative model not computed."
+        else:
+            # Neither univariate nor multivariate are acceptable; compute alternative.
+            forecast_alt = alternative_forecast_model(train, test_subset)
+            mape_alt = calculate_mape(test_subset['Units_sold'].values, forecast_alt['yhat'].values)
+            # Choose the method with the lowest error among the ones computed.
+            error_dict = {"univariate": mape_uni, "multivariate": mape_multi, "alternative": mape_alt}
+            final_method = min(error_dict, key=error_dict.get)
+            if final_method == "univariate":
+                final_forecast = forecast_uni
+            elif final_method == "multivariate":
+                final_forecast = forecast_multi
+            else:
+                final_forecast = forecast_alt
+            decision_note = ("None of the forecasts met the acceptable threshold. " +
+                             f"Method with the lowest MAPE selected: {final_method}.")
     else:
-        # None meet the threshold; choose the method with the lowest MAPE.
-        error_dict = {"univariate": mape_uni,
-                      "multivariate": mape_multi if mape_multi is not None else float('inf'),
-                      "alternative": mape_alt}
+        # Multivariate is not available; compute alternative forecast.
+        forecast_alt = alternative_forecast_model(train, test_subset)
+        mape_alt = calculate_mape(test_subset['Units_sold'].values, forecast_alt['yhat'].values)
+        error_dict = {"univariate": mape_uni, "alternative": mape_alt}
         final_method = min(error_dict, key=error_dict.get)
         if final_method == "univariate":
             final_forecast = forecast_uni
-        elif final_method == "multivariate":
-            final_forecast = forecast_multi
         else:
             final_forecast = forecast_alt
-        decision_note = ("None of the forecasts met the acceptable MAPE threshold. "
-                         f"Method with the lowest MAPE selected: {final_method}.")
-
-# Optionally, load and display RL Q-table info (for transparency)
-try:
-    with open("trained_rl_agent.pkl", "rb") as f:
-        trained_q_table = pickle.load(f)
-    # For display purposes, we show Q-values for state "high"
-    rl_choice, q_values = choose_forecast_method(trained_q_table, "high")
-except Exception as e:
-    q_values = {}
-    rl_choice = "N/A"
-    st.warning("RL Q-table could not be loaded. " + str(e))
+        decision_note = ("Multivariate forecast not available. " +
+                         f"Final forecast selected: {final_method}.")
 
 # -----------------------------------
-# Display Forecast Comparison Metrics
+# Display Forecast Metrics
 # -----------------------------------
 st.write("### Forecast Comparison Metrics")
-metrics = {
-    "Forecast Method": ["Univariate", "Multivariate", "Alternative", "Final Decision"],
-    "MAPE (%)": [
-        f"{mape_uni:.2f}",
-        f"{mape_multi:.2f}" if mape_multi is not None else "N/A",
-        f"{mape_alt:.2f}",
-        "Final: " + f"{final_method} ({calculate_mape(test_subset['Units_sold'].values, final_forecast['yhat'].values):.2f})"
-    ]
-}
+# Prepare a DataFrame only for the forecasts that were computed.
+metrics = {"Forecast Method": [], "MAPE (%)": []}
+metrics["Forecast Method"].append("Univariate")
+metrics["MAPE (%)"].append(f"{mape_uni:.2f}")
+if forecast_multi is not None:
+    metrics["Forecast Method"].append("Multivariate")
+    metrics["MAPE (%)"].append(f"{mape_multi:.2f}")
+if forecast_alt is not None:
+    metrics["Forecast Method"].append("Alternative")
+    metrics["MAPE (%)"].append(f"{mape_alt:.2f}")
+metrics["Forecast Method"].append("Final Decision")
+final_mape = calculate_mape(test_subset['Units_sold'].values, final_forecast['yhat'].values)
+metrics["MAPE (%)"].append(f"{final_method} ({final_mape:.2f})")
 metrics_df = pd.DataFrame(metrics)
 st.table(metrics_df)
 
 st.write("**Decision Note:**", decision_note)
-st.write("**RL Q-Table (state='high'):**", q_values)
 
 # -----------------------------------
 # Visualization: Historical Data and Final Forecast
@@ -191,16 +171,18 @@ historical_data["Type"] = "Historical"
 forecast_vis = final_forecast.copy().rename(columns={'ds': 'Date', 'yhat': 'Units_sold'})
 forecast_vis["Type"] = "Forecast"
 
-# Combine historical and forecast data
-plot_df = pd.concat([historical_data[['Date', 'Units_sold', 'Type']], forecast_vis[['Date', 'Units_sold', 'Type']]])
-plot_df = plot_df.sort_values("Date")
+# Combine historical data and forecast
+plot_df = pd.concat([
+    historical_data[['Date', 'Units_sold', 'Type']],
+    forecast_vis[['Date', 'Units_sold', 'Type']]
+]).sort_values("Date")
 
+# Create an interactive Altair chart so that users can zoom/pan.
 chart = alt.Chart(plot_df).mark_line().encode(
-    x='Date:T',
-    y='Units_sold:Q',
-    color=alt.Color('Type:N', scale=alt.Scale(domain=['Historical', 'Forecast'],
-                                                range=['blue', 'green']))
-).properties(
+    x=alt.X('Date:T', axis=alt.Axis(title="Date")),
+    y=alt.Y('Units_sold:Q', axis=alt.Axis(title="Units Sold")),
+    color=alt.Color('Type:N', scale=alt.Scale(domain=['Historical', 'Forecast'], range=['blue', 'green']))
+).interactive().properties(
     width=700,
     height=400,
     title="Historical Data (Blue) and Final Forecast (Green)"
@@ -208,21 +190,7 @@ chart = alt.Chart(plot_df).mark_line().encode(
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------------
-# Detailed Forecast Outputs
+# Detailed Forecast Output: Only show the final forecast details
 # -----------------------------------
-st.write("## Detailed Forecast Outputs")
-
-st.write("#### Univariate Forecast")
-st.dataframe(forecast_uni)
-
-if forecast_multi is not None:
-    st.write("#### Multivariate Forecast")
-    st.dataframe(forecast_multi)
-else:
-    st.write("#### Multivariate Forecast: Not available (regressors missing)")
-
-st.write("#### Alternative Forecast")
-st.dataframe(forecast_alt)
-
-st.write("#### Final Forecast (Final Decision: " + final_method + ")")
+st.write("## Final Forecast Output")
 st.dataframe(final_forecast)
